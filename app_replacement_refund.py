@@ -1,0 +1,303 @@
+import streamlit as st
+import pandas as pd
+from datetime import datetime, date
+import io
+
+st.set_page_config(page_title="Amazon Replacement Analyzer", page_icon="🔄", layout="wide")
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f2937;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        color: #6b7280;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 2px solid #e5e7eb;
+        background-color: #f9fafb;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+def process_replacement_data(replace_file, return_file, refund_file, bulk_rto_file, reim_file, days_threshold: int):
+    """Process replacement data with all lookups and filters"""
+    try:
+        # Load Replace.csv
+        Replace = pd.read_csv(replace_file)
+        
+        # Convert date and calculate difference
+        Replace['Date'] = pd.to_datetime(Replace['shipment-date'], errors='coerce').dt.date
+        Replace['Today_Date'] = date.today()
+        Replace['Date_Difference'] = (pd.to_datetime(Replace['Today_Date']) - pd.to_datetime(Replace['Date'])).dt.days
+        
+        # Load Return.csv
+        Return = pd.read_csv(return_file)
+        
+        # FBA Original Return Lookup (Column I → Column B → Column 8)
+        lookup_value_col = Replace.columns[8]
+        lookup_key_col = Return.columns[1]
+        return_value_col = Return.columns[8]
+        
+        Replace = Replace.merge(
+            Return[[lookup_key_col, return_value_col]],
+            how="left",
+            left_on=lookup_value_col,
+            right_on=lookup_key_col
+        )
+        Replace.rename(columns={return_value_col: "FBA Original Return"}, inplace=True)
+        Replace.drop(columns=[lookup_key_col], inplace=True, errors="ignore")
+        
+        # FBA Replacement Return Lookup (Column H → Column B → Column 8)
+        lookup_value_col = Replace.columns[7]
+        lookup_key_col = Return.columns[1]
+        return_value_col = Return.columns[8]
+        
+        Replace = Replace.merge(
+            Return[[lookup_key_col, return_value_col]],
+            how="left",
+            left_on=lookup_value_col,
+            right_on=lookup_key_col
+        )
+        Replace.rename(columns={return_value_col: "FBA Replacement Return"}, inplace=True)
+        Replace.drop(columns=[lookup_key_col], inplace=True, errors="ignore")
+        
+        # Filter 1: Damaged Returns
+        filtered_df = Replace[
+            (
+                Replace["FBA Original Return"].isin(["CARRIER_DAMAGED", "CUSTOMER_DAMAGED"]) &
+                Replace["FBA Replacement Return"].isin(["CARRIER_DAMAGED", "CUSTOMER_DAMAGED"])
+            )
+        ].copy()
+        
+        # Load Reimbursement
+        Reimbursement = pd.read_excel(reim_file, sheet_name='Sheet1')
+        
+        # Filter reimbursement data
+        filtered_reimb = Reimbursement[
+            Reimbursement["reason"].isin(["CustomerReturn", "CustomerServiceIssue"])
+        ].copy()
+        
+        # Add CountIF
+        filtered_reimb.loc[:, "CountIF"] = (
+            filtered_reimb.groupby("amazon-order-id")["amazon-order-id"].transform("count")
+        )
+        
+        # Merge CountIF into filtered_df
+        lookup_value_col = filtered_df.columns[8]
+        lookup_key_col = filtered_reimb.columns[3]
+        return_value_col = filtered_reimb.columns[18]
+        
+        filtered_df = filtered_df.merge(
+            filtered_reimb[[lookup_key_col, return_value_col]],
+            how="left",
+            left_on=lookup_value_col,
+            right_on=lookup_key_col
+        )
+        filtered_df.rename(columns={return_value_col: "CountIF"}, inplace=True)
+        filtered_df.drop(columns=[lookup_key_col], inplace=True, errors="ignore")
+        
+        # 🔍 Filter: CountIF = 1 and Date_Difference >= days_threshold
+        filtered_df_final = filtered_df[
+            (filtered_df["CountIF"] == 1.0) &
+            (filtered_df["Date_Difference"] >= days_threshold)
+        ].copy()
+        
+        # Load Refund Only file
+        Refund = pd.read_excel(refund_file, sheet_name='Sheet1')
+        
+        # Refund Check Lookup
+        lookup_value_col = Replace.columns[8]
+        lookup_key_col = Refund.columns[4]
+        
+        Replace = Replace.merge(
+            Refund[[lookup_key_col]].drop_duplicates(),
+            how="left",
+            left_on=lookup_value_col,
+            right_on=lookup_key_col
+        )
+        Replace["Refund Check"] = Replace[lookup_key_col]
+        Replace.drop(columns=[lookup_key_col], inplace=True, errors="ignore")
+        
+        # Filter 2: Refund without Returns
+        filtered_df_step2 = Replace[
+            (
+                (Replace["FBA Original Return"].isna()) |
+                (Replace["FBA Original Return"].astype(str).str.upper().eq("NA"))
+            ) &
+            (
+                (Replace["FBA Replacement Return"].isna()) |
+                (Replace["FBA Replacement Return"].astype(str).str.upper().eq("NA"))
+            ) &
+            (
+                (~Replace["Refund Check"].astype(str).str.upper().eq("NA")) &
+                (~Replace["Refund Check"].isna())
+            ) &
+            (
+                (Replace["Date_Difference"] >= days_threshold)
+            )
+        ].copy()
+        
+        # Load Bulk RTO
+        BulkRTO = pd.read_excel(bulk_rto_file, sheet_name="All")
+        
+        # Door Step Return Lookup
+        lookup_value_col = filtered_df_step2.columns[8]
+        lookup_key_col = BulkRTO.columns[0]
+        
+        filtered_df_step2 = filtered_df_step2.merge(
+            BulkRTO[[lookup_key_col]].drop_duplicates(),
+            how="left",
+            left_on=lookup_value_col,
+            right_on=lookup_key_col
+        )
+        filtered_df_step2["Door Step Return"] = filtered_df_step2[lookup_key_col]
+        filtered_df_step2.drop(columns=[lookup_key_col], inplace=True, errors="ignore")
+        
+        # Filter 3: No Door Step Return
+        filtered_df_step3 = filtered_df_step2[
+            (filtered_df_step2["Door Step Return"].isna()) |
+            (filtered_df_step2["Door Step Return"].astype(str).str.strip().str.upper().eq("NA"))
+        ].copy()
+        
+        return {
+            'main': Replace,
+            'damaged_returns': filtered_df_final,
+            'refund_without_return': filtered_df_step3,
+            'damaged_count': len(filtered_df_final),
+            'refund_count': len(filtered_df_step3)
+        }
+        
+    except Exception as e:
+        st.error(f"Error processing files: {str(e)}")
+        return None
+
+# Main App
+st.markdown('<div class="main-header">🔄 Amazon Replacement Data Analyzer</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Upload your files to analyze replacement and return data</div>', unsafe_allow_html=True)
+
+# File Upload Section
+st.markdown("### 📁 Upload Required Files")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    replace_file = st.file_uploader("Replace.csv", type=['csv'], key="replace")
+    return_file = st.file_uploader("Return.csv", type=['csv'], key="return")
+    refund_file = st.file_uploader("Refund Only.xlsx", type=['xlsx'], key="refund")
+
+with col2:
+    bulk_rto_file = st.file_uploader("Bulk RTO Returns.xlsx", type=['xlsx'], key="bulk")
+    reim_file = st.file_uploader("Reimbursement.xlsx", type=['xlsx'], key="reim")
+
+# ⏱️ Days slicer / input
+st.markdown("### ⏱️ Days Filter")
+days_threshold = st.number_input(
+    "Consider records older than (days):",
+    min_value=0,
+    max_value=365,
+    value=40,       # default 40 days
+    step=1,
+    help="Example: 10, 30, 40, 45, 60..."
+)
+
+# Process Button
+all_files = [replace_file, return_file, refund_file, bulk_rto_file, reim_file]
+if all(all_files):
+    if st.button("🔍 Analyze Replacement Data", type="primary", use_container_width=True):
+        with st.spinner("Processing data... This may take a moment."):
+            results = process_replacement_data(*all_files, days_threshold)
+            
+            if results:
+                st.success("✅ Analysis completed successfully!")
+                
+                # Display Statistics
+                st.markdown("### 📈 Analysis Results")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Total Replacements", f"{len(results['main']):,}")
+                
+                with col2:
+                    st.metric(
+                        f"Damaged Returns (≥{int(days_threshold)} days)",
+                        f"{results['damaged_count']:,}", 
+                        help=f"Replacements with CARRIER_DAMAGED or CUSTOMER_DAMAGED status and age ≥ {int(days_threshold)} days"
+                    )
+                
+                with col3:
+                    st.metric(
+                        f"Refund without Return (≥{int(days_threshold)} days)",
+                        f"{results['refund_count']:,}",
+                        help=f"Refunds processed but no return record found, age ≥ {int(days_threshold)} days"
+                    )
+                
+                # Data Preview
+                st.markdown("### 📊 Data Preview")
+                
+                tab1, tab2, tab3 = st.tabs(["Damaged Returns", "Refund Without Return", "Full Data"])
+                
+                with tab1:
+                    st.markdown(f"**Replacements with damaged items (≥{int(days_threshold)} days old)**")
+                    st.dataframe(results['damaged_returns'], use_container_width=True)
+                
+                with tab2:
+                    st.markdown(f"**Replacements with refund but no return record (≥{int(days_threshold)} days old)**")
+                    st.dataframe(results['refund_without_return'], use_container_width=True)
+                
+                with tab3:
+                    st.markdown("**All processed replacement data**")
+                    st.dataframe(results['main'], use_container_width=True)
+                
+                # Download Buttons
+                st.markdown("### 💾 Download Reports")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        results['damaged_returns'].to_excel(writer, index=False, sheet_name='Damaged Returns')
+                    st.download_button(
+                        "⬇️ Download Damaged Returns",
+                        buffer.getvalue(),
+                        "damaged_returns_report.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with col2:
+                    buffer2 = io.BytesIO()
+                    with pd.ExcelWriter(buffer2, engine='openpyxl') as writer:
+                        results['refund_without_return'].to_excel(writer, index=False, sheet_name='Refund Without Return')
+                    st.download_button(
+                        "⬇️ Download Refund Without Return",
+                        buffer2.getvalue(),
+                        "refund_without_return_report.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                with col3:
+                    buffer3 = io.BytesIO()
+                    with pd.ExcelWriter(buffer3, engine='openpyxl') as writer:
+                        results['main'].to_excel(writer, index=False, sheet_name='All Replacements')
+                    st.download_button(
+                        "⬇️ Download Full Report",
+                        buffer3.getvalue(),
+                        "full_replacement_report.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+else:
+    st.info("👆 Please upload all required files to begin analysis")
+
+# Footer
+st.markdown("---")
+st.markdown("*Amazon Seller Replacement & Return Analysis Tool*")
